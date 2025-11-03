@@ -9,14 +9,14 @@ from dotenv import load_dotenv
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 
 sleep_time_between_pages = 4
 cards_header = ["Name", "Treatment", "Name Without Treatment", "Set", "Rarity", "Quantity", "Condition/Language", "Price", "Image URL", "Product URL"]
 wanted_cards_header = ["Quantity", "Name"]
 found_cards_header = ["Name"]
 
-global_cards = []
+global_cards_checked_from_beginning = []
 #accpetable items
 #[ "name", "link", "price", "market_price", "quantity", "printing", "quantity_to_get", "total_price" ]
 global_stores = []
@@ -70,12 +70,76 @@ def setup_selenium_driver(headless):
     if headless:
         options.add_argument("--headless=new")
 
+    options.add_argument('--log-level=3')
     options.add_argument('--start-maximized')
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
     
     driver = Chrome(options=options)
 
     return driver
+
+def check_for_multiple_cards(driver,multiples):
+    cards = []
+    for card in multiples:
+        driver.get(card["link"])
+        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section.listing-item")))
+        time.sleep(0.5)
+
+        #get the universal things like foil vs non foil market price
+        market_prices = driver.find_elements(By.CSS_SELECTOR, "span.near-mint-table__price")
+        non_foil_market_price = market_prices[0].text.strip().replace("$","").replace(",","")
+        if len(market_prices) > 1:
+            foil_market_price = market_prices[1].text.strip().replace("$","").replace(",","")
+        else:
+            #we should never get here, but it happened once. dunno how
+            foil_market_price = non_foil_market_price
+
+        listings = driver.find_elements(By.CSS_SELECTOR, "section.listing-item")
+        #find all the different listings. could be near mint foil, lightly played foil, moderately played foil...
+        for listing in listings:
+            try:
+                listing_div = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info span")
+            except:
+                listing_div = None
+
+            if listing_div:
+
+                try:
+                    price = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info__price").text.strip()
+                    price = price.replace("$","").replace(",","")
+                except:
+                    continue
+                    price = None
+
+                try:
+                    quality = listing.find_element(By.CSS_SELECTOR, "h3.listing-item__listing-data__info__condition").text.strip()
+                except:
+                    continue
+
+                try:
+                    quantity = listing.find_element(By.CSS_SELECTOR, ".add-to-cart__available").text
+                    quantity = "".join(char for char in quantity if char.isdigit())
+                except:
+                    continue
+                    
+                if "foil" in quality:
+                    market_price = foil_market_price
+                else:
+                    market_price = non_foil_market_price
+
+            cards.append({
+                "name": card["name"],
+                "link": card["link"],
+                "price": price,
+                "market_price": market_price,
+                "quantity": quantity,
+                "printing": card["printing"],
+                "set": card["set"],
+                "quality": quality
+            })
+
+    return cards
 
 def search_card(driver,card,store_url):
     """searches for a card and returns a list of valid cards. can have multiple cards because of various printings"""
@@ -98,6 +162,7 @@ def search_card(driver,card,store_url):
 
     driver.get(url)
     found = WebDriverWait(driver, 10).until(either_element_present)
+    time.sleep(0.5)
 
     if found == "blank":
         return None
@@ -105,6 +170,7 @@ def search_card(driver,card,store_url):
     #get search results
     results = driver.find_elements(By.CSS_SELECTOR, "div.search-result")
     cards = []
+    multiples = []
     for result in results:
         try:
             og_name = result.find_element(By.CSS_SELECTOR, ".product-card__title").text
@@ -118,6 +184,13 @@ def search_card(driver,card,store_url):
             printing = ""
 
         try:
+            quantity = result.find_element(By.CSS_SELECTOR, ".inventory__listing-count").text
+            quantity = "".join(char for char in quantity if char.isdigit())
+        except:
+            continue
+            quantity = "N/A"
+
+        try:
             link = result.find_element(By.TAG_NAME, "a").get_attribute("href")
         except:
             continue
@@ -127,30 +200,44 @@ def search_card(driver,card,store_url):
             price = result.find_element(By.CSS_SELECTOR, ".inventory__price-with-shipping").text
             price = price.replace("$","").replace(",","")
         except:
+            #im not sure how we get here
+            print("couldnt find the price for: " + link)
+            continue
             price = "N/A"
 
         try:
             market_price = result.find_element(By.CSS_SELECTOR, ".product-card__market-price--value").text
             market_price = market_price.replace("$","").replace(",","")
         except:
-            market_price = "N/A"
+            #this should never happen but it happened once
+            print("couldnt find market price for: " + link)
+            continue
+            market_price = "N/A"        
         
         try:
-            quantity = result.find_element(By.CSS_SELECTOR, ".inventory__listing-count").text
-            quantity = "".join(char for char in quantity if char.isdigit())
+            mtg_set = result.find_element(By.CSS_SELECTOR, "div.product-card__set-name__variant").text
         except:
-            continue
-            quantity = "N/A"
+            mtg_set = "N/A"
 
-        cards.append({
-            "name": name,
-            "link": link,
-            "price": price,
-            "market_price": market_price,
-            "quantity": quantity,
-            "printing": printing
-        })
-
+        card_to_append = {
+                "name": name,
+                "link": link,
+                "price": price,
+                "market_price": market_price,
+                "quantity": quantity,
+                "printing": printing,
+                "set": mtg_set,
+                "quality": ""
+            }
+        #if theres more than 1 quantity and we are on a store page, the store may have more than 1 listing that gets reported as the same card. eg foil/non-foil
+        if int(quantity) > 1 and store_url:
+            multiples.append(card_to_append)
+        else:
+            cards.append(card_to_append)
+    
+    cards_to_append = check_for_multiple_cards(driver,multiples)
+    for card in cards_to_append:
+        cards.append(card)
     return cards
 
 def find_lowest_price_card(cards, use_market):
@@ -172,6 +259,7 @@ def get_total_pages(driver):
     try:
         # Find all the page number elements
         WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.tcg-pagination__pages a.tcg-button")))
+        time.sleep(0.5)
         pages = driver.find_elements(By.CSS_SELECTOR, "div.tcg-pagination__pages a.tcg-button")
 
         page_numbers = []
@@ -209,6 +297,7 @@ def find_stores(driver,card):
     driver.get(card["link"])
 
     WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "div.tcg-input-select__trigger")))
+    time.sleep(0.5)
     triggers = driver.find_elements(By.CSS_SELECTOR, "div.tcg-input-select__trigger")
     triggers[1].click()
     
@@ -231,6 +320,7 @@ def find_stores(driver,card):
         if page > 1:
             driver.get(paginated_url)
         WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section.listing-item")))
+        time.sleep(0.5)
 
         listings = driver.find_elements(By.CSS_SELECTOR, "section.listing-item")
         #find all stores with free shipping over $5
@@ -238,6 +328,8 @@ def find_stores(driver,card):
             try:
                 listing_div = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info span")
             except:
+                #why are we here?
+                print("no listing div??")
                 listing_div = None
 
             # Check for free shipping link
@@ -252,8 +344,7 @@ def find_stores(driver,card):
                 except:
                     # Case 2: Shipping included
                     try:
-                        shipping_span = listing.find_element(By.CSS_SELECTOR, "span[data-v-08a43c10]")  # adjust selector to match context
-                        shipping_links = shipping_span.find_elements(By.TAG_NAME, "a")
+                        shipping_links = listing.find_elements(By.TAG_NAME, "a")
 
                         for link in shipping_links:
                             link_text = link.text.strip()
@@ -278,6 +369,7 @@ def find_stores(driver,card):
                     if already_in_stores:
                         continue
                 except:
+                    print("why would we be here??")
                     continue
                     sellerid = None
                     seller = None
@@ -286,6 +378,7 @@ def find_stores(driver,card):
                     price = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info__price").text.strip()
                     price = price.replace("$","").replace(",","")
                 except:
+                    print("why would we be here?")
                     continue
                     price = None
 
@@ -350,6 +443,7 @@ def print_card(card):
     if "quantity_to_get" in card:
         print("Quantity to get: " + str(card["quantity_to_get"]))
     print("Printing: " + card["printing"])
+    print("Set: " + card["set"])
     print("-----")
     return
 
@@ -484,22 +578,34 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
         
         #clear cache in case we are on a store page
         reset_tcgplayer_state(driver)
-        cards = search_card(driver, parent_desired_card,"")
-        if cards is None:
-            print("couldnt find cards: " + parent_desired_card[1])
-            time.sleep(20)
-            quit()
-        card = find_lowest_price_card(cards, True)
-        if card is None:
-            print("couldnt find card: " + parent_desired_card[1])
-            print(cards.__len__())
-            time.sleep(20)
-            quit()
-        find_stores(driver, card)
-        # Print all stores with free shipping over $5 for testing
-        #print("checking the stores we found on the card page")
-        #print_card(card)
+        already_checked = False
+        for name in global_cards_checked_from_beginning:
+            if parent_desired_card[1] == name:
+                already_checked = True
+        if not already_checked:
+            global_cards_checked_from_beginning.append(parent_desired_card[1])
+            cards = search_card(driver, parent_desired_card,"")
+            if cards is None:
+                print("couldnt find cards: " + parent_desired_card[1])
+                time.sleep(20)
+                quit()
 
+            lowest_card = find_lowest_price_card(cards, True)
+
+            if lowest_card is None:
+                print("couldnt find card: " + parent_desired_card[1])
+                print(cards.__len__())
+                time.sleep(20)
+                quit()
+
+            #use the lowest priced card and then try to get similarly priced printings to check those too
+            for card in cards:
+                if float(card["market_price"]) <= 2.0+float(lowest_card["market_price"]):
+                    find_stores(driver, card)
+            # Print all stores with free shipping over $5 for testing
+            #print("checking the stores we found on the card page")
+            #print_card(card)
+        
         found_enough = False
         while not found_enough:
             evaluation_score = 0.0
@@ -567,6 +673,65 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
                 return cart_stores
     return cart_stores
 
+def add_potential_cart_to_cart(driver,stores):
+    for store in stores:
+        for card in store["cards_scanned"]:
+            if int(card["quantity_to_get"]) > 0:
+                driver.get(card["link"])
+                WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section.listing-item")))
+                time.sleep(0.5)
+                #WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "select[data-testid='mp-select__UpdateProductQuantity']")))
+                #WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")))
+                #make sure we dont add the thing by tcg direct as stores can contain both from tcg direct and not
+                listings = driver.find_elements(By.CSS_SELECTOR, "section.listing-item")
+                #pick the one without tcgplayer direct
+                for listing in listings:
+                    listing_div = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info span")
+                    if listing_div:
+                        try:
+                            has_direct_icon = listing_div.find_element(By.CSS_SELECTOR, "img.filterIcon iconDirect")
+                            if not has_direct_icon:
+                                #make sure this is the same card quality
+                                if card["quality"] != "":
+                                    quality = listing.find_element(By.CSS_SELECTOR, "h3.listing-item__listing-data__info__condition").text.strip()
+                                    print("quality is: " + quality)
+                                    if card["quality"] != quality:
+                                        #this aint the same one we picked. find the next listing
+                                        continue
+                                qty_dropdown = listing.find_element(By.CSS_SELECTOR, "select[data-testid='mp-select__UpdateProductQuantity']")
+                                select = Select(qty_dropdown)
+                                #choose how many
+                                select.select_by_value(card["quantity_to_get"])
+                                button = listing.find_element(By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")
+                                #click button
+                                driver.execute_script("arguments[0].click();", button)
+                                break
+                        except:
+                            try:
+                                #if we dont have the direct icon, we can get here
+                                #make sure this is the same card quality
+                                if card["quality"] != "":
+                                    quality = listing.find_element(By.CSS_SELECTOR, "h3.listing-item__listing-data__info__condition").text.strip()
+                                    print("quality is: " + quality)
+                                    if card["quality"] != quality:
+                                        #this aint the same one we picked. find the next listing
+                                        continue
+                                qty_dropdown = listing.find_element(By.CSS_SELECTOR, "select[data-testid='mp-select__UpdateProductQuantity']")
+                                select = Select(qty_dropdown)
+                                #choose how many
+                                select.select_by_value(card["quantity_to_get"])
+                                button = listing.find_element(By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")
+                                #click button
+                                driver.execute_script("arguments[0].click();", button)
+                                break
+                            except Exception as e:
+                                print(f"Error adding card from {card["link"]}: {e}")
+
+                #wait to make sure it was added to cart
+                time.sleep(1)
+                
+    return
+
 def main(argv):
     want_file_location = ""
     headless = False
@@ -607,21 +772,39 @@ def main(argv):
 
     driver = setup_selenium_driver(headless)
 
-    cart_stores1 = build_possible_cart(driver, desired_cards,25,2,1)
+    cart_stores1 = build_possible_cart(driver, desired_cards,25,2,3)
     cart_stores2 = build_possible_cart(driver, desired_cards,5,10,0.5)
-    cart_stores3 = build_possible_cart(driver, desired_cards,20,2,3)
+    cart_stores3 = build_possible_cart(driver, desired_cards,15,8,2)
+
+    price_over_whole_cart=0.00
+    number_of_stores=0
     print("Possible stores to buy from cart 1:")
     print()
     for store in cart_stores1:
         print_store(store,True)
+        number_of_stores += 1
+        price_over_whole_cart += store["total_cost"]
+    print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
+    price_over_whole_cart=0.00
+    number_of_stores=0
+    
     print("Possible stores to buy from cart 2:")
     print()
     for store in cart_stores2:
         print_store(store,True)
+        number_of_stores += 1
+        price_over_whole_cart += store["total_cost"]
+    print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
+    price_over_whole_cart=0.00
+    number_of_stores=0
+
     print("Possible stores to buy from cart 3:")
     print()
     for store in cart_stores3:
         print_store(store,True)
+        number_of_stores += 1
+        price_over_whole_cart += store["total_cost"]
+    print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
     
     #store_card_inventory = scrape_store_by_sets(store_front_url)
     #found_cards_in_inventory_df = find_wanted_cards_dataframe(store_card_inventory, desired_cards)
@@ -637,6 +820,18 @@ def main(argv):
     #print("Cards scraped: " + str(total_cards_scraped))
     #print("Cards scraped per second: " + str(cards_scraped_per_second))
 
+    #get which cart the user likes
+    response = str(input("Please select which cart you like: "))
+    if response == "1":
+        add_potential_cart_to_cart(driver,cart_stores1)
+    if response == "2":
+        add_potential_cart_to_cart(driver,cart_stores2)
+    if response == "3":
+        add_potential_cart_to_cart(driver,cart_stores3)
+
+    #wait for the user to check out or copy cart or something
+    input("Press enter when finished.")
+    print("cleaning up")
     driver.quit()
 
 if __name__ == "__main__":
