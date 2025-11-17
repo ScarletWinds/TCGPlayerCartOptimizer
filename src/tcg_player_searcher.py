@@ -10,11 +10,22 @@ from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait, Select
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from selenium.webdriver.common.action_chains import ActionChains
+import re
 
 sleep_time_between_pages = 4
 cards_header = ["Name", "Treatment", "Name Without Treatment", "Set", "Rarity", "Quantity", "Condition/Language", "Price", "Image URL", "Product URL"]
 wanted_cards_header = ["Quantity", "Name"]
 found_cards_header = ["Name"]
+
+num_threads = 5
+driver_pool = queue.Queue()
+
+acceptable_conditions = [ "Near+Mint", "Lightly+Played", "Moderately+Played" ]
+#url looks like Condition=Near+Mint|Lightly+Played|Moderately+Played
 
 global_cards_checked_from_beginning = []
 #accpetable items
@@ -22,7 +33,7 @@ global_cards_checked_from_beginning = []
 global_stores = []
 #acceptable items
 #[ "seller", "sellerid", "total_cost", "cards_scanned", "checked_inventory", "score" ]
-
+global_stores_lock = threading.Lock()
 
 def load_desired_cards_from_file(file_location):
     """Attempts to load the desired cards to search against store inventory from a txt file hat is space delimited. Format is: {qty} {name}. Reference example in desired_cards_example.txt.
@@ -79,12 +90,42 @@ def setup_selenium_driver(headless):
 
     return driver
 
-def check_for_multiple_cards(driver,multiples):
+def check_for_multiple_cards(driver,multiples,num_retries=0):
+
+    def either_element_present(driver):
+        results = driver.find_elements(By.CSS_SELECTOR, "section.listing-item")
+        blank = driver.find_elements(By.CSS_SELECTOR, "div.blank-slate")
+        if results:
+            time.sleep(2)
+            return "results"
+        elif blank:
+            return "blank"
+        else:
+            if "tcgplayer.com/uhoh" in driver.current_url:
+                return "uhoh"
+            return False  # keep waiting
+        
     cards = []
     for card in multiples:
         driver.get(card["link"])
-        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section.listing-item")))
+        found = WebDriverWait(driver, 10).until(either_element_present)
         time.sleep(0.5)
+
+        if found == "blank":
+            return []
+        if found == "uhoh":
+            if num_retries == 0:
+                print("staring on the recusion on multiples card: " + card["link"])
+            #print("went to uhoh page for multiples section url: " + card["link"])
+            if num_retries >= 10:
+                print("too many retries, giving up on multiples card: " + card["link"])
+                return []
+            reset_tcgplayer_state(driver)
+            time.sleep(120)
+            uhoh_cards = check_for_multiple_cards(driver,multiples,num_retries=num_retries+1)
+            if num_retries == 0:
+                print("solved multiples uhoh problem")
+            return uhoh_cards
 
         #get the universal things like foil vs non foil market price
         market_prices = driver.find_elements(By.CSS_SELECTOR, "span.near-mint-table__price")
@@ -141,7 +182,7 @@ def check_for_multiple_cards(driver,multiples):
 
     return cards
 
-def search_card(driver,card,store_url):
+def search_card(driver,card,store_url,num_retries=0):
     """searches for a card and returns a list of valid cards. can have multiple cards because of various printings"""
 
     def either_element_present(driver):
@@ -152,11 +193,15 @@ def search_card(driver,card,store_url):
         elif blank:
             return "blank"
         else:
+            if "tcgplayer.com/uhoh" in driver.current_url:
+                return "uhoh"
             return False  # keep waiting
     
     #open the page
     if not store_url:
         url = "https://www.tcgplayer.com/search/magic/product?productLineName=Magic%3A+The+Gathering&q=" + urllib.parse.quote(card[1])
+        if acceptable_conditions:
+            url += "&Condition=" + "|".join(acceptable_conditions)
     else:
         url = store_url
 
@@ -166,6 +211,16 @@ def search_card(driver,card,store_url):
 
     if found == "blank":
         return None
+    if found == "uhoh":
+        print("recursing because of uhoh page for url: " + url)
+        if num_retries >= 10:
+            print("too many retries, giving up on card: " + url)
+            return None
+        reset_tcgplayer_state(driver)
+        uhoh_cards = search_card(driver,card,store_url,num_retries=num_retries+1)
+        if num_retries == 0:
+            print("solved search_card uhoh problem")
+        return uhoh_cards
 
     #get search results
     results = driver.find_elements(By.CSS_SELECTOR, "div.search-result")
@@ -291,13 +346,42 @@ def check_reasonable_price(card, listing_price):
     else:
         return False
 
-def find_stores(driver,card):
+def find_stores(driver,card,num_retries=0):
     """finds all the stores with free shipping over $5 for the given card"""
+
+    def either_element_present(driver):
+        results = driver.find_elements(By.CSS_SELECTOR, "div.tcg-input-select__trigger")
+        blank = driver.find_elements(By.CSS_SELECTOR, "div.blank-slate")
+        if results:
+            return "results"
+        elif blank:
+            return "blank"
+        else:
+            if "tcgplayer.com/uhoh" in driver.current_url:
+                return "uhoh"
+            return False  # keep waiting
+
     #go to the card page
     driver.get(card["link"])
-
-    WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "div.tcg-input-select__trigger")))
+    result = WebDriverWait(driver, 10).until(either_element_present)
     time.sleep(0.5)
+
+    if result == "blank":
+        print("no results found for card: " + card["link"])
+        exit()
+        return
+    if result == "uhoh":
+        print("went to uhoh page for url: " + card["link"])
+        if num_retries >= 10:
+            print("too many retries, giving up on multiples card: " + card["link"])
+            exit()
+        reset_tcgplayer_state(driver)
+        time.sleep(120)
+        find_stores(driver,card,num_retries=num_retries+1)
+        if num_retries == 0:
+            print("solved find_stores uhoh problem")
+        return
+
     triggers = driver.find_elements(By.CSS_SELECTOR, "div.tcg-input-select__trigger")
     triggers[1].click()
     
@@ -315,7 +399,14 @@ def find_stores(driver,card):
 
     #paginate through all pages
     for page in range(1, pages + 1):
-        paginated_url = card["link"] + "&page=" + str(page)
+        if "page=" in card["link"]:
+            # Replace existing page number
+            paginated_url = re.sub(r"page=\d+", f"page={page}", card["link"])
+        else:
+            # Append page parameter
+            separator = "&" if "?" in card["link"] else "?"
+            paginated_url = f"{card['link']}{separator}page={page}"
+        #paginated_url = card["link"] + "&page=" + str(page)
         #skip page 1 since we're already on it
         if page > 1:
             driver.get(paginated_url)
@@ -361,36 +452,30 @@ def find_stores(driver,card):
                 try:
                     seller = listing.find_element(By.CSS_SELECTOR, "a.seller-info__name").text.strip()
                     sellerid = listing.find_element(By.CSS_SELECTOR, "a.seller-info__name").get_attribute("href").split("/")[-1]
-                    already_in_stores = False
-                    for store in global_stores:
-                        if store["sellerid"] == sellerid:
-                            already_in_stores = True
-                            break
-                    if already_in_stores:
-                        continue
-                except:
-                    print("why would we be here??")
+                    with global_stores_lock:
+                        already_in_stores = any(store["sellerid"] == sellerid for store in global_stores)
+                        if already_in_stores:
+                            continue
+                except Exception as e:
+                    print(f"Error processing store: {e}")
                     continue
-                    sellerid = None
-                    seller = None
 
                 try:
                     price = listing.find_element(By.CSS_SELECTOR, "div.listing-item__listing-data__info__price").text.strip()
                     price = price.replace("$","").replace(",","")
-                except:
-                    print("why would we be here?")
+                except Exception as e:
+                    print(f"Error processing store: {e}")
                     continue
-                    price = None
 
                 #only add if the price is within $3 of market price
                 if check_reasonable_price(card, price):
-                    global_stores.append({
-                        "seller": seller,
-                        "sellerid": sellerid,
-                        "checked_inventory": False,
-                        "score": 0.0
-                    })
-
+                    with global_stores_lock:
+                        global_stores.append({
+                            "seller": seller,
+                            "sellerid": sellerid,
+                            "checked_inventory": False,
+                            "score": 0.0
+                        })
     return
 
 def check_store_inventory(driver,store,desired_cards):
@@ -405,9 +490,27 @@ def check_store_inventory(driver,store,desired_cards):
     #loop through all the cards we want on this particular store
     for desired_card in desired_cards:
         url = store_url + urllib.parse.quote(desired_card[1])
-        cards = search_card(driver, desired_card, url) #this is a list of all the cards that are valid printings
+        if acceptable_conditions:
+            url += "&Condition=" + "|".join(acceptable_conditions)
+        cards = None
+        
+        #check 3 times
+        for attempt in range(3):  # try up to 3 times
+            try:
+                cards = search_card(driver, desired_card, url)
+                break  # exit loop if successful
+                # Check if it's a "No results" page — don't retry if true
+            except Exception as e:
+                if "tcgplayer.com/uhoh" in driver.current_url:
+                    cards = None
+                    continue
+
         if cards is None:
             continue
+
+        #cards = search_card(driver, desired_card, url) #this is a list of all the cards that are valid printings
+        #if cards is None:
+        #    continue
         cards.sort(key=lambda x: float(x["price"]))
         amount_needed = int(desired_card[0])
         #go through cards from lowest price to highest
@@ -444,6 +547,8 @@ def print_card(card):
         print("Quantity to get: " + str(card["quantity_to_get"]))
     print("Printing: " + card["printing"])
     print("Set: " + card["set"])
+    if "quality" in card:
+        print("Quality: " + card["quality"])
     print("-----")
     return
 
@@ -474,8 +579,11 @@ def evaluate_store(store, desired_cards, coverage_weight, efficiency_weight, shi
     total_market = 0.0
 
     for card in store["cards_scanned"]:
+        # only consider this scanned card if it matches a desired card AND we will actually take >0 of it
         if any(desired_card[1].lower() == card["name"].lower() for desired_card in desired_cards):
-            qty = int(card["quantity_to_get"])
+            qty = int(card.get("quantity_to_get", 0))
+            if qty <= 0:
+                continue   # don't treat zero-quantity matches as coverage
             market = float(card["market_price"])
             price = float(card["price"])
             covered_cards += 1
@@ -537,31 +645,65 @@ def reset_tcgplayer_state(driver):
 
 def adjust_quantity_to_get(store, desired_cards):
     new_store_inventory = []
-    
-    for card in store["cards_scanned"]:
-        # find the desired card that matches this store card
-        matching_desired = None
-        for desired_card in desired_cards:
-            if desired_card[1].lower() == card["name"].lower():
-                matching_desired = desired_card
-                break
-        
-        if matching_desired:
-            qty_needed = int(matching_desired[0])
-            qty_available = int(card["quantity"])
-            card["quantity_to_get"] = str(min(qty_needed, qty_available))
-        else:
-            # If card is not in desired_cards, leave quantity_to_get as is
-            card["quantity_to_get"] = "0"
-        
+    desired_remaining = {dc[1].lower(): int(dc[0]) for dc in desired_cards}
+
+    # Sort cards by price so we prioritize cheaper ones first
+    sorted_cards = sorted(
+        store["cards_scanned"],
+        key=lambda c: float(c.get("price", "999999")),  # safely handle missing price
+    )
+
+    for card in sorted_cards:
+        name = card["name"].lower()
+        qty_available = int(card["quantity"])
+        qty_to_get = 0
+
+        if name in desired_remaining:
+            qty_needed = desired_remaining[name]
+            if qty_needed > 0:
+                qty_to_get = min(qty_needed, qty_available)
+                desired_remaining[name] -= qty_to_get
+
+        card["quantity_to_get"] = str(qty_to_get)
         new_store_inventory.append(card)
-    
+
     store["cards_scanned"] = new_store_inventory
     return store
 
-def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_weight, shipping_weight):
+def thread_check_store(store, desired_cards, coverage_weight, efficiency_weight, shipping_weight):
+    """Thread worker: borrows a driver, checks store, evaluates it, returns result."""
+    local_driver = get_driver()
+    try:
+        if store["checked_inventory"] != True:
+            reset_tcgplayer_state(local_driver) #dont know where this driver has been, could be dirty
+        found_store = check_store_inventory(local_driver, store, desired_cards)
+        found_store = adjust_quantity_to_get(found_store, desired_cards)
+        found_store = evaluate_store(
+            found_store, desired_cards,
+            coverage_weight, efficiency_weight, shipping_weight
+        )
+        return found_store
+    except Exception as e:
+        print(f"Error checking store {store['seller']}: {e}")
+        return None
+    finally:
+        release_driver(local_driver)
+
+def thread_find_stores(card):
+    """Thread worker: borrows a driver, finds stores for the card."""
+    local_driver = get_driver()
+    try:
+        reset_tcgplayer_state(local_driver) #dont know where this driver has been, could be dirty
+        find_stores(local_driver, card)
+    except Exception as e:
+        print(f"Error finding stores for card {card['name']}: {e}")
+    finally:
+        release_driver(local_driver)
+
+def build_possible_cart(desired_cards_og, coverage_weight, efficiency_weight, shipping_weight):
     cart_stores = []
     found_cards = []
+    desired_cards = []
     unmodified_desired_cards = copy.deepcopy(desired_cards_og)
     desired_cards = copy.deepcopy(desired_cards_og)
 
@@ -576,19 +718,23 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
         if double_break:
             continue
         
-        #clear cache in case we are on a store page
-        reset_tcgplayer_state(driver)
+
         already_checked = False
         for name in global_cards_checked_from_beginning:
             if parent_desired_card[1] == name:
                 already_checked = True
         if not already_checked:
             global_cards_checked_from_beginning.append(parent_desired_card[1])
+            driver = get_driver()
+            #clear cache in case we are on a store page
+            reset_tcgplayer_state(driver)
             cards = search_card(driver, parent_desired_card,"")
             if cards is None:
+                print("couldnt find any cards, should never get here")
                 print("couldnt find cards: " + parent_desired_card[1])
                 time.sleep(20)
                 quit()
+            release_driver(driver)
 
             lowest_card = find_lowest_price_card(cards, True)
 
@@ -599,13 +745,25 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
                 quit()
 
             #use the lowest priced card and then try to get similarly priced printings to check those too
-            for card in cards:
-                if float(card["market_price"]) <= 2.0+float(lowest_card["market_price"]):
-                    find_stores(driver, card)
+            cards_to_check = [
+                card for card in cards
+                if float(card["market_price"]) <= 2.0 + float(lowest_card["market_price"])
+            ]
+
+            MAX_THREADS = min(len(cards_to_check), num_threads)
+
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = [executor.submit(thread_find_stores, card) for card in cards_to_check]
+
+                for future in as_completed(futures):
+                    try:
+                        future.result()  # will raise if there was an exception
+                    except Exception as e:
+                        print(f"Error in thread: {e}")
             # Print all stores with free shipping over $5 for testing
             #print("checking the stores we found on the card page")
             #print_card(card)
-        
+
         found_enough = False
         while not found_enough:
             evaluation_score = 0.0
@@ -613,25 +771,35 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
             
             if global_stores == []:
                 print("No stores found for card: " + parent_desired_card[1])
+                time.sleep(20)
                 quit()
 
-            #go through all stores and find the one with the best evaluation score
-            for store in global_stores:
-                already_in_cart = False
-                for cart_store in cart_stores:
-                    if store["sellerid"] == cart_store["sellerid"]:
-                        already_in_cart = True
-                        break
-                if already_in_cart:
-                    continue
-                
-                found_store = check_store_inventory(driver, store, desired_cards)
-                found_store = adjust_quantity_to_get(found_store,desired_cards)
-                found_store = evaluate_store(found_store, desired_cards, coverage_weight, efficiency_weight, shipping_weight)
-                if evaluation_score < found_store["score"]:
-                    evaluation_score = found_store["score"]
-                    best_store = found_store
-            
+            # Filter stores that aren't already in cart and still need checking
+            stores_to_check = [
+                store for store in global_stores
+                if not any(s["sellerid"] == store["sellerid"] for s in cart_stores)
+            ]
+
+            # Adjust thread count based on how many browser instances you can handle
+            MAX_THREADS = min(num_threads, len(stores_to_check))
+            if MAX_THREADS > 0:
+                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                    future_to_store = {
+                        executor.submit(thread_check_store, store, desired_cards, coverage_weight, efficiency_weight, shipping_weight): store
+                        for store in stores_to_check
+                    }
+
+                    for future in as_completed(future_to_store):
+                        result = future.result()
+                        if result and result["score"] > evaluation_score:
+                            evaluation_score = result["score"]
+                            best_store = result
+                        #else:
+                        #    for found_store in global_stores:
+                        #        if found_store and found_store["score"] > evaluation_score:
+                        #            evaluation_score = found_store["score"]
+                        #            best_store = found_store
+
             if not best_store:
                 print("couldnt find a best store... why?")
                 for desired_card in desired_cards:
@@ -643,14 +811,18 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
             cart_stores.append(best_store)
             #remove the cards we found from the desired cards list
             for card in best_store["cards_scanned"]:
-                for i in range(desired_cards.__len__()):
+                for i in range(len(desired_cards)):
                     if card["name"].lower() == desired_cards[i][1].lower():
                         amount_needed = int(desired_cards[i][0])
-                        amount_found = int(card["quantity_to_get"])
-                        #check if we found all we need for this card
+                        amount_found = int(card.get("quantity_to_get", 0))
+                        if amount_found <= 0:
+                            # nothing to apply for this entry
+                            break
+
+                        # existing bookkeeping (update found_cards etc.)
                         already_in_found = False
                         card_in_found = None
-                        for j in range(found_cards.__len__()):
+                        for j in range(len(found_cards)):
                             if found_cards[j][1].lower() == card["name"].lower():
                                 found_cards[j][0] = str(int(found_cards[j][0]) + amount_found)
                                 card_in_found = found_cards[j]
@@ -659,21 +831,24 @@ def build_possible_cart(driver,desired_cards_og, coverage_weight, efficiency_wei
                         if not already_in_found:
                             found_cards.append([amount_found, card["name"]])
                             card_in_found = [amount_found, card["name"]]
+
                         if parent_desired_card[1].lower() == card_in_found[1].lower() and int(parent_desired_card[0]) <= int(card_in_found[0]):
                             found_enough = True
+
                         desired_cards[i][0] = str(max(0, amount_needed - amount_found))
                         print("added this card to the cart: " + str(amount_found) + " " + desired_cards[i][1])
+                        break
 
             #trim off the desired cards that have no quantity left
             desired_cards = [dc for dc in desired_cards if int(dc[0]) > 0]
             print("things still to look for: ")
             print(desired_cards)
             print("-----")
-            if desired_cards == []:
+            if desired_cards == []: 
                 return cart_stores
     return cart_stores
 
-def add_potential_cart_to_cart(driver,stores):
+def add_potential_cart_to_cart(driver,stores): #TODO fix the thing where only some cards get added
     for store in stores:
         for card in store["cards_scanned"]:
             if int(card["quantity_to_get"]) > 0:
@@ -694,12 +869,20 @@ def add_potential_cart_to_cart(driver,stores):
                                 #make sure this is the same card quality
                                 if card["quality"] != "":
                                     quality = listing.find_element(By.CSS_SELECTOR, "h3.listing-item__listing-data__info__condition").text.strip()
-                                    print("quality is: " + quality)
+                                    #print("quality is: " + quality)
                                     if card["quality"] != quality:
                                         #this aint the same one we picked. find the next listing
                                         continue
+                                if int(card["quantity_to_get"]) > 1:
+                                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", listing)
+                                    time.sleep(0.5)
+                                    target = listing.find_element(By.CSS_SELECTOR, "div.add-to-cart__dropdown__overlay")
+                                    ActionChains(driver).move_to_element(target).pause(0.05).click(target).perform()
+                                    time.sleep(0.5)
+
                                 qty_dropdown = listing.find_element(By.CSS_SELECTOR, "select[data-testid='mp-select__UpdateProductQuantity']")
                                 select = Select(qty_dropdown)
+                                available_values = [opt.get_attribute("value") for opt in select.options]
                                 #choose how many
                                 select.select_by_value(card["quantity_to_get"])
                                 button = listing.find_element(By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")
@@ -712,12 +895,20 @@ def add_potential_cart_to_cart(driver,stores):
                                 #make sure this is the same card quality
                                 if card["quality"] != "":
                                     quality = listing.find_element(By.CSS_SELECTOR, "h3.listing-item__listing-data__info__condition").text.strip()
-                                    print("quality is: " + quality)
+                                    #print("quality is: " + quality)
                                     if card["quality"] != quality:
                                         #this aint the same one we picked. find the next listing
                                         continue
+                                if int(card["quantity_to_get"]) > 1:
+                                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", listing)
+                                    time.sleep(0.5)
+                                    target = listing.find_element(By.CSS_SELECTOR, "div.add-to-cart__dropdown__overlay")
+                                    ActionChains(driver).move_to_element(target).pause(0.05).click(target).perform()
+                                    time.sleep(0.5)
+
                                 qty_dropdown = listing.find_element(By.CSS_SELECTOR, "select[data-testid='mp-select__UpdateProductQuantity']")
                                 select = Select(qty_dropdown)
+                                available_values = [opt.get_attribute("value") for opt in select.options]
                                 #choose how many
                                 select.select_by_value(card["quantity_to_get"])
                                 button = listing.find_element(By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")
@@ -726,11 +917,33 @@ def add_potential_cart_to_cart(driver,stores):
                                 break
                             except Exception as e:
                                 print(f"Error adding card from {card["link"]}: {e}")
+                                print("Card details: ")
+                                print_card(card)
+                                print("available values: " + str(available_values))
 
                 #wait to make sure it was added to cart
-                time.sleep(1)
+                time.sleep(3)
                 
     return
+
+def init_driver_pool(headless):
+    """Spin up the Chrome driver pool."""
+    for _ in range(num_threads):
+        driver_pool.put(setup_selenium_driver(headless))
+
+def get_driver():
+    """Get an available driver (blocks if none are free)."""
+    return driver_pool.get()
+
+def release_driver(driver):
+    """Return a driver back to the pool."""
+    driver_pool.put(driver)
+
+def shutdown_driver_pool():
+    """Close all Chrome instances at the end."""
+    while not driver_pool.empty():
+        driver = driver_pool.get()
+        driver.quit()
 
 def main(argv):
     want_file_location = ""
@@ -753,7 +966,8 @@ def main(argv):
 
     if not want_file_location:
         print("Please provide want file. Exiting.")
-        sys.exit(2)
+        want_file_location = "wanted.txt"
+        #sys.exit(2)
 
     load_dotenv()
 
@@ -770,18 +984,20 @@ def main(argv):
     print("Total desired cards to search for: " + str(num_desired_cards))
     
 
-    driver = setup_selenium_driver(headless)
+    #start the scraping
+    #driver = setup_selenium_driver(headless)
+    init_driver_pool(headless)
 
-    cart_stores1 = build_possible_cart(driver, desired_cards,25,2,3)
-    cart_stores2 = build_possible_cart(driver, desired_cards,5,10,0.5)
-    cart_stores3 = build_possible_cart(driver, desired_cards,15,8,2)
+    cart_stores1 = build_possible_cart(desired_cards,25,2,3)
+    cart_stores2 = build_possible_cart(desired_cards,5,10,0.5)
+    cart_stores3 = build_possible_cart(desired_cards,15,8,2)
 
     price_over_whole_cart=0.00
     number_of_stores=0
     print("Possible stores to buy from cart 1:")
     print()
     for store in cart_stores1:
-        print_store(store,True)
+        #print_store(store,True)
         number_of_stores += 1
         price_over_whole_cart += store["total_cost"]
     print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
@@ -791,7 +1007,7 @@ def main(argv):
     print("Possible stores to buy from cart 2:")
     print()
     for store in cart_stores2:
-        print_store(store,True)
+        #print_store(store,True)
         number_of_stores += 1
         price_over_whole_cart += store["total_cost"]
     print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
@@ -801,7 +1017,7 @@ def main(argv):
     print("Possible stores to buy from cart 3:")
     print()
     for store in cart_stores3:
-        print_store(store,True)
+        #print_store(store,True)
         number_of_stores += 1
         price_over_whole_cart += store["total_cost"]
     print("Total Cost: " + str(price_over_whole_cart) + " over " + str(number_of_stores) + " stores")
@@ -819,7 +1035,8 @@ def main(argv):
     print("Script run time: " + str(elapsed_time))
     #print("Cards scraped: " + str(total_cards_scraped))
     #print("Cards scraped per second: " + str(cards_scraped_per_second))
-
+    driver = get_driver()
+    shutdown_driver_pool()
     #get which cart the user likes
     response = str(input("Please select which cart you like: "))
     if response == "1":
@@ -828,11 +1045,11 @@ def main(argv):
         add_potential_cart_to_cart(driver,cart_stores2)
     if response == "3":
         add_potential_cart_to_cart(driver,cart_stores3)
-
+    release_driver(driver)
     #wait for the user to check out or copy cart or something
     input("Press enter when finished.")
     print("cleaning up")
-    driver.quit()
+    shutdown_driver_pool()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
