@@ -1,3 +1,4 @@
+from cProfile import label
 import time
 import math
 import getopt
@@ -20,15 +21,15 @@ import itertools
 from copy import deepcopy
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QToolBox, QGroupBox, QToolButton,
-    QTextEdit, QPushButton, QLabel, QSizePolicy, QMessageBox, QStackedWidget, QFrame
+    QTextEdit, QPushButton, QLabel, QSizePolicy, QMessageBox, QStackedWidget, QFrame, QCheckBox,
+    QSlider, QDialog, QSpacerItem
 )
-from PySide6.QtGui import QKeySequence, QIcon, QTransform
-from PySide6.QtCore import Qt, Slot, QEvent, QObject, Signal, QThread, QPropertyAnimation, QSize
+from PySide6.QtGui import QKeySequence, QIcon, QTransform, QTextOption
+from PySide6.QtCore import Qt, Slot, QEvent, QObject, Signal, QThread, QPropertyAnimation, QSize, QRect
 import sys
 
 num_threads = 5
 driver_pool = queue.Queue()
-acceptable_conditions = [ "Near+Mint", "Lightly+Played", "Moderately+Played" ]
 
 global_listings = []
 global_listings_lock = threading.Lock()
@@ -44,6 +45,7 @@ class InputWindow(QWidget):
         self.stack.addWidget(self.results_page())   # index 1
         self.stack.addWidget(self.scrape_wait_page())# index 2
         self.stack.addWidget(self.beam_wait_page()) # index 3
+        self.stack.addWidget(self.final_page())     # index 4
 
         # Add PAGE 1 (confirmation)
         #self.stack.addWidget(self.confirm_page())
@@ -51,7 +53,7 @@ class InputWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(self.stack)
         self.setWindowTitle("TCG Cart Optimizer")
-        self.setMinimumSize(1400, 700)
+        self.setMinimumSize(1600, 700)
         self.stack.setCurrentIndex(0)
 
     # --------------------------
@@ -69,14 +71,15 @@ class InputWindow(QWidget):
         layout.addWidget(lbl)
 
         # Large text edit
-        self.text_edit = QTextEdit()
+        self.text_edit = PlaceholderTextEdit()
         self.text_edit.setPlaceholderText(
-            "Examples:\n"
-            "2 Sol Ring [Non-Foil]\n"
-            "1 Arcane Signet (Extended Art) [Foil]\n"
-            "1 Lightning Bolt\n\n"
+            "Examples: \n"
+            "  2 Sol Ring \n"
+            "  1 Arcane Signet (Extended Art) [Foil] \n"
+            "  1 Lightning Bolt [Non-Foil]\n"
+            "  3 Counterspell (Original) \n"
         )
-        self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        #self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.text_edit, 1)
 
         # Buttons row
@@ -92,6 +95,21 @@ class InputWindow(QWidget):
         btn_row.addWidget(self.clear_btn)
 
         btn_row.addStretch()
+
+        self.near_mint_chkbx = QCheckBox("Near Mint")
+        self.near_mint_chkbx.setChecked(True)
+        btn_row.addWidget(self.near_mint_chkbx)
+        self.lightly_chkbx = QCheckBox("Lightly Played")
+        self.lightly_chkbx.setChecked(True)
+        btn_row.addWidget(self.lightly_chkbx)
+        self.moderate_chkbx = QCheckBox("Moderately Played")
+        self.moderate_chkbx.setChecked(True)
+        btn_row.addWidget(self.moderate_chkbx)
+        self.heavily_chkbx = QCheckBox("Heavily Played")
+        btn_row.addWidget(self.heavily_chkbx)
+        self.damaged_chkbx = QCheckBox("Damaged")
+        btn_row.addWidget(self.damaged_chkbx)
+
         layout.addLayout(btn_row)
 
         # Status / preview area
@@ -140,6 +158,24 @@ class InputWindow(QWidget):
             card = str(qty) + "   " + name + "     " + printing + "    " + foil
             preview += card + "\n"
 
+        preview += "\nAcceptable Conditions:\n"
+        acceptable_conditions = []
+        if self.near_mint_chkbx.isChecked():
+            acceptable_conditions.append("Near+Mint")
+            preview += "Near Mint  "
+        if self.lightly_chkbx.isChecked():
+            acceptable_conditions.append("Lightly+Played")
+            preview += "Lightly Played  "
+        if self.moderate_chkbx.isChecked():
+            acceptable_conditions.append("Moderately+Played")
+            preview += "Moderately Played  "
+        if self.heavily_chkbx.isChecked():
+            acceptable_conditions.append("Heavily+Played")
+            preview += "Heavily Played  "
+        if self.damaged_chkbx.isChecked():
+            acceptable_conditions.append("Damaged")
+            preview += "Damaged"
+
         # Show confirmation message box
         result = QMessageBox.question(
             self,
@@ -150,9 +186,11 @@ class InputWindow(QWidget):
 
         if result == QMessageBox.StandardButton.Yes:
             self.parsed = parsed
+
+            self.acceptable_conditions = acceptable_conditions
             self.stack.setCurrentIndex(2)
             self.scrape_thread = QThread()
-            self.scrape_worker = ScrapeWorker(parsed)
+            self.scrape_worker = ScrapeWorker(parsed, acceptable_conditions)
             self.scrape_worker.moveToThread(self.scrape_thread)
 
             # Connect signals
@@ -181,73 +219,135 @@ class InputWindow(QWidget):
     # --------------------------
     def results_page(self):
         page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setSpacing(5)
-        layout.setContentsMargins(5, 5, 5, 20)
-        layout.setAlignment(Qt.AlignTop)
+
+        outer = QVBoxLayout(page)
+
+        # --- store the row so we can add columns later ---
+        self.columns_row = QHBoxLayout()
+        self.columns_row.setSpacing(5)
+        self.columns_row.setAlignment(Qt.AlignTop)
 
         self.result_columns = []
-
-        titles = ["Best Price", "Fewest Stores", "Balanced", "User Customizable"]
+        titles = ["Best Price", "Fewest Stores", "Balanced"]
 
         for title in titles:
-            col_widget = QFrame()
-            col_widget.setFrameShape(QFrame.StyledPanel)
-            col_layout = QVBoxLayout(col_widget)
-            col_layout.setContentsMargins(2, 2, 2, 0)
-            col_layout.setSpacing(4)
+            self._add_result_column(title)
 
-            lbl_title = QLabel(title)
-            lbl_title.setStyleSheet("font-weight: bold; font-size: 16px;")
-            col_layout.addWidget(lbl_title)
+        outer.addLayout(self.columns_row)
 
-            #
-            # Always-visible area
-            #
-            info_box = QVBoxLayout()
-            col_layout.addLayout(info_box)
-
-            #
-            # Collapsible area for the cards
-            #
-            collapsible = CollapsibleSection("Show Items")
-            col_layout.addWidget(collapsible)
-
-            #
-            # Store references
-            #
-            self.result_columns.append({
-                "info": info_box,
-                "items": collapsible
-            })
-
-            btn = QPushButton(f"Select {title} Cart")
-            col_layout.addWidget(btn)
-
-            layout.addWidget(col_widget,1)
+        # customize row
+        customize_row = QHBoxLayout()
+        customize_row.addStretch()
+        customize_button = QPushButton("Build Custom Cart")
+        customize_button.clicked.connect(lambda _, t="Custom": self.build_custom(t))
+        customize_row.addWidget(customize_button)
+        outer.addLayout(customize_row)
 
         return page
-            
+
+    def _add_result_column(self, title):
+        col_widget = QFrame()
+        col_widget.setFrameShape(QFrame.StyledPanel)
+        col_layout = QVBoxLayout(col_widget)
+        col_layout.setContentsMargins(2, 2, 2, 0)
+        col_layout.setSpacing(4)
+
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet("font-weight: bold; font-size: 16px;")
+        col_layout.addWidget(lbl_title)
+
+        info_box = QVBoxLayout()
+        col_layout.addLayout(info_box)
+
+        collapsible = CollapsibleSection("Show Items")
+        col_layout.addWidget(collapsible)
+
+        btn = QPushButton(f"Select {title} Cart")
+        btn.clicked.connect(lambda _, t=title: self.add_to_cart(t))
+        col_layout.addWidget(btn)
+
+        self.result_columns.append({
+            "title": title,
+            "info": info_box,
+            "items": collapsible,
+            "widget": col_widget
+        })
+
+        self.columns_row.addWidget(col_widget, 1)
+
     def add_result_row(self, layout, text):
         lbl = QLabel(text)
         lbl.setWordWrap(True)
         layout.insertWidget(layout.count() - 1, lbl)  # before stretch
 
     def show_results(self, results):
+        carts = ['best_price_cart','fewest_stores_cart','balanced_cart']
+
         for i in range(3):
             col = self.result_columns[i]
 
             # Always visible
-            col["info"].addWidget(QLabel(f"Number of Stores: {results['best_price_cart']['num_stores']}"))
-            col["info"].addWidget(QLabel(f"Total: ${results['best_price_cart']['total_cost']:.2f}"))
-            col["info"].addWidget(QLabel(f"Weights used: {results['best_price_cart']['weights']}"))
+            col["info"].addWidget(QLabel(f"Number of Stores: {results[carts[i]]['num_stores']}"))
+            col["info"].addWidget(QLabel(f"Subtotal: ${results[carts[i]]['subtotal']:.2f}"))
+            col["info"].addWidget(QLabel(f"Shipping (assuming $3 per package if not free shipping): ${results[carts[i]]['shipping']:.2f}"))
+            col["info"].addWidget(QLabel(f"Total: ${results[carts[i]]['total_cost']:.2f}"))
+            col["info"].addWidget(QLabel(f"Weights used:  coverage {str(results[carts[i]]['weights']['coverage'])}, variety {str(results[carts[i]]['weights']['variety'])}"))
+            #col["info"].addWidget(QLabel(f"    coverage {str(results[carts[i]]['weights']['coverage'])}, variety {str(results[carts[i]]['weights']['variety'])}"))
+            col["info"].addWidget(QLabel(f"    price_efficiency {str(results[carts[i]]['weights']['price_efficiency'])}, store_penalty {str(results[carts[i]]['weights']['store_penalty'])}"))
 
             # Collapsible items
-            for store_id in results['best_price_cart']['selected_store_ids']:
-                for listings in results['best_price_cart']['cart'][store_id]['items'].items():
-                    for listing in listings:
-                        lbl = QLabel(str(listing))
-                        col["items"].add_row(lbl)
+            for store_id in results[carts[i]]['selected_store_ids']:
+                label = QLabel(str(store_id))
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                col["items"].add_row(label)
+                for listings in results[carts[i]]['cart'][store_id]['items'].items():
+                    for listing_num in range(0, len(listings), 2): #the card name and price info are on different lines so skip every other line
+                        card = "  " + listings[listing_num][0] #card name 
+                        if listings[listing_num][1] != "": #printing
+                            card += " " + listings[listing_num][1]
+                        if listings[listing_num][2]: #foil
+                            card += " " + listings[listing_num+1][0]["raw"]["foilness"]
+                        else:
+                            card += " Non-Foil"
+                        label = QLabel(card)
+                        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                        col["items"].add_row(label)
+                        for inner_listing in listings[listing_num+1]:
+                            pricing = "    " + str(inner_listing["qty"]) + " x $" + str(inner_listing["price_each"]) + " = $" + str(inner_listing["total"]) + " | Market: $" + str(inner_listing["raw"]["market_price"]) + "  "  + str(inner_listing["raw"]["link"])
+                            label = QLabel(pricing)
+                            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                            col["items"].add_row(label)
+        
+    def add_to_cart(self, title):
+        cart_key_map = {
+            "Best Price": "best_price_cart",
+            "Fewest Stores": "fewest_stores_cart",
+            "Balanced": "balanced_cart",
+            "Custom": "custom_cart"
+        }
+
+        key = cart_key_map.get(title)
+        cart = self.cart_results.get(key)
+
+        if not cart:
+            QMessageBox.warning(self, "Missing Cart", "No cart results available.")
+            return
+
+        # Threading
+        self.add_thread = QThread()
+        self.add_worker = AddCartWorker(cart)
+        self.add_worker.moveToThread(self.add_thread)
+
+        self.add_thread.started.connect(self.add_worker.run)
+        self.add_worker.finished.connect(self.add_thread.quit)
+        self.add_worker.finished.connect(self.add_worker.deleteLater)
+        self.add_thread.finished.connect(self.add_thread.deleteLater)
+
+        self.add_worker.error.connect(lambda e: QMessageBox.warning(self, "Error", e))
+
+        self.add_thread.start()
+
+        self.stack.setCurrentIndex(4)
 
     # --------------------------
     # PAGE 2 — waiting page
@@ -321,21 +421,114 @@ class InputWindow(QWidget):
         layout.addStretch()
 
         return page
+    
+    # --------------------------
+    # PAGE 4 — final page for adding carts
+    # --------------------------
+    def final_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Stretch above and below centers the label
+        layout.addStretch()
+
+        lbl = QLabel("Adding the selected cart to your cart. Go to the last open browser and wait for it to finish. Leave this window open")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet("font-size: 20px; font-weight: bold;")
+        layout.addWidget(lbl)
+
+        layout.addStretch()
+
+        return page
+
+    def build_custom(self, title):
+        dlg = WeightDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            weights = dlg.get_weights()
+            self.custom_weights = weights
+
+            # create a new beam worker with weights
+            self.stack.setCurrentIndex(3)
+
+            self.custom_thread = QThread()
+            self.custom_worker = BeamWorker(self.parsed, weights=weights)
+            self.custom_worker.moveToThread(self.custom_thread)
+
+            self.custom_thread.started.connect(self.custom_worker.run)
+            self.custom_worker.finished.connect(self.on_custom_beam_done)
+            self.custom_worker.error.connect(self.on_beam_error)
+
+            self.custom_worker.finished.connect(self.custom_thread.quit)
+            self.custom_worker.finished.connect(self.custom_worker.deleteLater)
+            self.custom_thread.finished.connect(self.custom_thread.deleteLater)
+
+            self.custom_thread.start()
+    
+    def on_custom_beam_done(self, result):
+        # append result to cart_results
+        self.cart_results["custom_cart"] = result["balanced_cart"]
+
+        # add the column dynamically
+        self._add_result_column("Custom")
+
+        # fill that column with data
+        new_index = len(self.result_columns) - 1
+        col = self.result_columns[new_index]
+
+        # use same population logic
+        cart = self.cart_results["custom_cart"]
+
+        col["info"].addWidget(QLabel(f"Number of Stores: {result['balanced_cart']['num_stores']}"))
+        col["info"].addWidget(QLabel(f"Subtotal: ${result['balanced_cart']['subtotal']:.2f}"))
+        col["info"].addWidget(QLabel(f"Shipping (assuming $3 per package if not free shipping): ${result['balanced_cart']['shipping']:.2f}"))
+        col["info"].addWidget(QLabel(f"Total: ${result['balanced_cart']['total_cost']:.2f}"))
+        col["info"].addWidget(QLabel(f"Weights used:  coverage {str(result['balanced_cart']['weights']['coverage'])}, variety {str(result['balanced_cart']['weights']['variety'])}"))
+        col["info"].addWidget(QLabel(f"    price_efficiency {str(result['balanced_cart']['weights']['price_efficiency'])}, store_penalty {str(result['balanced_cart']['weights']['store_penalty'])}"))
+
+        for store_id in cart['selected_store_ids']:
+            label = QLabel(str(store_id))
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            col["items"].add_row(label)
+            for listings in result["balanced_cart"]['cart'][store_id]['items'].items():
+                for listing_num in range(0, len(listings), 2): #the card name and price info are on different lines so skip every other line
+                    card = "  " + listings[listing_num][0] #card name 
+                    if listings[listing_num][1] != "": #printing
+                        card += " " + listings[listing_num][1]
+                    if listings[listing_num][2]: #foil
+                        card += " " + listings[listing_num+1][0]["raw"]["foilness"]
+                    else:
+                        card += " Non-Foil"
+                    label = QLabel(card)
+                    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    col["items"].add_row(label)
+                    for inner_listing in listings[listing_num+1]:
+                        pricing = "    " + str(inner_listing["qty"]) + " x $" + str(inner_listing["price_each"]) + " = $" + str(inner_listing["total"]) + " | Market: $" + str(inner_listing["raw"]["market_price"]) + "  "  + str(inner_listing["raw"]["link"])
+                        label = QLabel(pricing)
+                        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                        col["items"].add_row(label)
+
+        # update layout
+        self.columns_row.update()
+        self.stack.setCurrentIndex(1)
 
 
 class ScrapeWorker(QObject):
     finished = Signal()     # send results back
     error = Signal(str)
 
-    def __init__(self, cards):
+    def __init__(self, cards, acceptable_conditions):
         super().__init__()
         self.cards = cards
+        self.acceptable_conditions = acceptable_conditions
 
     @Slot()
     def run(self):
         try:
             # Call your long-running function
-            start_scraping(self.cards)
+            start_scraping(self.cards,self.acceptable_conditions)
+            shutdown_all_but_one_driver()
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -402,9 +595,148 @@ class CollapsibleSection(QWidget):
             self.scroll.setMaximumHeight(0)  # collapse
             #self.scroll.setMinimumHeight(0)
 
-    # Add rows into the CONTENT, not into the outer layout
     def add_row(self, widget):
         self.content_layout.addWidget(widget)
+
+class AddCartWorker(QObject):
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, cart):
+        super().__init__()
+        self.cart = cart
+
+    def run(self):
+        try:
+            driver = get_driver()
+            add_potential_cart_to_cart(driver, self.cart)
+            release_driver(driver)
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+class WeightDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Weights")
+        self.resize(450, 300)
+
+        layout = QVBoxLayout(self)
+
+        self.sliders = {}
+        names = ["coverage", "variety", "price_efficiency", "store_penalty"]
+        descriptions = ["Picks stores with more coverage of wanted cards","Picks stores with more variety earlier","Values cheaper cards higher","Values less stores in the cart"]
+        recommended_values = ["Recommended Values: 1-10","Recommended Values: 1-10","Recommended Values: 2-15","Recommended Values: 5-25"]
+
+        for name,desc,rec in zip(names,descriptions,recommended_values):
+            row = QHBoxLayout()
+
+            label = QLabel(name)
+            label.setMinimumWidth(90)
+            row.addWidget(label)
+
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(1)     # = 0.1
+            slider.setMaximum(400)   # = 40.0
+            slider.setValue(50)     # default = 10.0
+            slider.setSingleStep(1)
+
+            value_label = QLabel("5.0")
+            value_label.setMinimumWidth(40)
+
+            def make_callback(lbl):
+                return lambda v: lbl.setText(f"{v/10:.1f}")
+
+            slider.valueChanged.connect(make_callback(value_label))
+
+            row.addWidget(slider)
+            row.addWidget(value_label)
+
+            layout.addLayout(row)
+            desc_label = QLabel(desc)
+            layout.addWidget(desc_label)
+            rec_label = QLabel(rec)
+            layout.addWidget(rec_label)
+            layout.addSpacing(20)
+
+            self.sliders[name] = slider
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+
+        button_row.addWidget(ok_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+    def get_weights(self):
+        return {name: [slider.value() / 10] for name, slider in self.sliders.items()}
+
+class PlaceholderTextEdit(QTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Overlay QLabel used as the multiline placeholder
+        self._placeholder = QLabel(self)
+        self._placeholder.setWordWrap(True)
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._placeholder.setStyleSheet("color: gray;")  # placeholder color
+        self._placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # let clicks fall through to the edit
+        self._placeholder.setMargin(4)
+
+        # Keep placeholder on top visually
+        self._placeholder.raise_()
+
+        # Hide placeholder when the user types or there's content
+        self.textChanged.connect(self._update_placeholder_visibility)
+
+        # Initial visibility
+        self._update_placeholder_visibility()
+
+    def setPlaceholderText(self, text: str):
+        """
+        Accepts a multiline string. Use '\\n' for newlines.
+        You can also embed HTML if you want formatting (then call setTextFormat on the label).
+        """
+        # If you prefer HTML formatting, do:
+        # self._placeholder.setTextFormat(Qt.RichText)
+        # self._placeholder.setText(html_text)
+        self._placeholder.setText(text)
+        self._update_placeholder_geometry()
+        self._update_placeholder_visibility()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_placeholder_geometry()
+
+    def _update_placeholder_geometry(self):
+        # Place the placeholder inside the content area, leaving a small margin
+        # We use viewport() geometry so the label sits where text starts in the text edit.
+        try:
+            vp = self.viewport().geometry()
+            # Slight inset from left/top so cursor and text don't overlap.
+            left_inset = 6
+            top_inset = 6
+            # width should account for vertical scrollbar if present
+            width = vp.width() - left_inset - 6
+            height = max(20, vp.height() - top_inset - 6)
+            self._placeholder.setGeometry(QRect(vp.left() + left_inset, vp.top() + top_inset, width, height))
+        except Exception:
+            # fallback: full widget area
+            self._placeholder.setGeometry(self.rect().adjusted(6, 6, -6, -6))
+
+    def _update_placeholder_visibility(self):
+        is_empty = (len(self.toPlainText().strip()) == 0)
+        self._placeholder.setVisible(is_empty)
+
+    # Optional convenience: let callers query/set placeholder via property
+    def placeholderText(self):
+        return self._placeholder.text()
 
 def load_desired_cards(input):
     """Attempts to load the desired cards to search against store inventory from a txt file hat is space delimited. Format is: {qty} {name}. Reference example in desired_cards_example.txt.
@@ -486,6 +818,12 @@ def shutdown_driver_pool():
         driver = driver_pool.get()
         driver.quit()
 
+def shutdown_all_but_one_driver():
+    #keep one driver open for the final cart
+    while driver_pool.qsize() > 1:
+        driver = driver_pool.get()
+        driver.quit()
+
 def reset_tcgplayer_state(driver):
     # Load the domain so JS can access its local/session storage
     driver.get("https://www.tcgplayer.com")
@@ -509,7 +847,7 @@ def reset_tcgplayer_state(driver):
     driver.get("about:blank")
     time.sleep(1)
 
-def search_card(card,driver=None,num_retries=0):
+def search_card(card,acceptable_conditions=None,driver=None,num_retries=0):
     """searches for a card on the base tcgplayer page and returns a list of cards"""
     if driver is None:
         driver = get_driver()
@@ -546,7 +884,7 @@ def search_card(card,driver=None,num_retries=0):
             return None
         reset_tcgplayer_state(driver)
         time.sleep(120)
-        uhoh_cards = search_card(card,driver,num_retries=num_retries+1)
+        uhoh_cards = search_card(card,acceptable_conditions,driver,num_retries=num_retries+1)
         if num_retries == 0:
             print("solved search_card uhoh problem")
             release_driver(driver)
@@ -1297,11 +1635,15 @@ def generate_multiple_carts(
         for sid, st in cart.items():
             st["shipping"] = 0.0 if st["subtotal"] >= 5.0 else 3.0
             st["total"] = st["subtotal"] + st["shipping"]
-
+        
+        subtotal = sum(st["subtotal"] for st in cart.values())
+        shipping = sum(st["shipping"] for st in cart.values())
         total_cost = sum(st["total"] for st in cart.values())
         final_results.append({
             "selected_store_ids": list(sel),
             "cart": cart,
+            "subtotal": subtotal,
+            "shipping": shipping,
             "total_cost": total_cost,
             "num_stores": len(cart),
             "weights": weights
@@ -1533,7 +1875,7 @@ def search_multiple_weight_configs(wanted_cards, stores, weight_grid, beam_width
         "balanced_cart": balanced_cart["result"]["balanced_cart"]
     }
 
-def start_scraping(desired_cards):
+def start_scraping(desired_cards,acceptable_condidtions):
         
     start = time.time()
 
@@ -1553,7 +1895,7 @@ def start_scraping(desired_cards):
     MAX_THREADS = min(num_desired_cards, num_threads)
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = [executor.submit(search_card, desired_card) for desired_card in desired_cards]
+        futures = [executor.submit(search_card, desired_card, acceptable_condidtions) for desired_card in desired_cards]
 
         for future in as_completed(futures):
             try:
@@ -1570,6 +1912,8 @@ def start_scraping(desired_cards):
     for card in cards_to_check:
         if card not in new_cards_to_check:
             new_cards_to_check.append(card)
+    
+    MAX_THREADS = min(len(new_cards_to_check), num_threads)
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         futures = [executor.submit(find_stores, card) for card in new_cards_to_check]
