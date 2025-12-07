@@ -14,4 +14,4 @@ this is to install the python libraries. could probably trim it down
 
 ## Script Usage
 
-    tcg_player_searcher.py -w <want-file-location>
+    python newTCGPlayerScraper.py
