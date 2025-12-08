@@ -329,14 +329,16 @@ class InputWindow(QWidget):
                             col["items"].add_row(label)
         
     def add_to_cart(self, title):
-        cart_key_map = {
-            "Best Price": "best_price_cart",
-            "Fewest Stores": "fewest_stores_cart",
-            "Balanced": "balanced_cart",
-            "Custom": "custom_cart"
-        }
+        if "Custom" in title:
+            key = f"custom_cart_{title.split()[-1]}"
+        else:
+            cart_key_map = {
+                "Best Price": "best_price_cart",
+                "Fewest Stores": "fewest_stores_cart",
+                "Balanced": "balanced_cart",
+            }
+            key = cart_key_map.get(title)
 
-        key = cart_key_map.get(title)
         cart = self.cart_results.get(key)
 
         if not cart:
@@ -364,14 +366,16 @@ class InputWindow(QWidget):
         self.status_label.setText(f"Status: exported cart to {filename}")
 
     def export_cart(self, title):
-        cart_key_map = {
-            "Best Price": "best_price_cart",
-            "Fewest Stores": "fewest_stores_cart",
-            "Balanced": "balanced_cart",
-            "Custom": "custom_cart"
-        }
+        if "Custom" in title:
+            key = f"custom_cart_{title.split()[-1]}"
+        else:
+            cart_key_map = {
+                "Best Price": "best_price_cart",
+                "Fewest Stores": "fewest_stores_cart",
+                "Balanced": "balanced_cart",
+            }
+            key = cart_key_map.get(title)
 
-        key = cart_key_map.get(title)
         cart = self.cart_results.get(key)
 
         if not cart:
@@ -517,17 +521,20 @@ class InputWindow(QWidget):
     
     def on_custom_beam_done(self, result):
         # append result to cart_results
-        self.cart_results["custom_cart"] = result["balanced_cart"]
+        num_carts = len(self.cart_results) - 3
+        cart_key = f"custom_cart_{num_carts}"
 
+        self.cart_results[cart_key] = result["balanced_cart"]
         # add the column dynamically
-        self._add_result_column("Custom")
+        cart_title = f"Custom {num_carts}"
+        self._add_result_column(cart_title)
 
         # fill that column with data
         new_index = len(self.result_columns) - 1
         col = self.result_columns[new_index]
 
         # use same population logic
-        cart = self.cart_results["custom_cart"]
+        cart = self.cart_results[cart_key]
 
         col["info"].addWidget(QLabel(f"Number of Stores: {result['balanced_cart']['num_stores']}"))
         col["info"].addWidget(QLabel(f"Subtotal: ${result['balanced_cart']['subtotal']:.2f}"))
