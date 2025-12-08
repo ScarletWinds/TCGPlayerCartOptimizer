@@ -27,6 +27,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QKeySequence, QIcon, QTransform, QTextOption
 from PySide6.QtCore import Qt, Slot, QEvent, QObject, Signal, QThread, QPropertyAnimation, QSize, QRect
 import sys
+import csv
+from datetime import datetime
+
 
 num_threads = 5
 driver_pool = queue.Queue()
@@ -237,6 +240,9 @@ class InputWindow(QWidget):
 
         # customize row
         customize_row = QHBoxLayout()
+        self.status_label = QLabel("Status: waiting for input")
+        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        customize_row.addWidget(self.status_label)
         customize_row.addStretch()
         customize_button = QPushButton("Build Custom Cart")
         customize_button.clicked.connect(lambda _, t="Custom": self.build_custom(t))
@@ -265,6 +271,10 @@ class InputWindow(QWidget):
         btn = QPushButton(f"Select {title} Cart")
         btn.clicked.connect(lambda _, t=title: self.add_to_cart(t))
         col_layout.addWidget(btn)
+
+        exportbtn = QPushButton(f"Export {title} Cart")
+        exportbtn.clicked.connect(lambda _, t=title: self.export_cart(t))
+        col_layout.addWidget(exportbtn)
 
         self.result_columns.append({
             "title": title,
@@ -339,6 +349,7 @@ class InputWindow(QWidget):
         self.add_worker.moveToThread(self.add_thread)
 
         self.add_thread.started.connect(self.add_worker.run)
+        #self.add_worker.finished.connect(self.on_add_finished)
         self.add_worker.finished.connect(self.add_thread.quit)
         self.add_worker.finished.connect(self.add_worker.deleteLater)
         self.add_thread.finished.connect(self.add_thread.deleteLater)
@@ -347,7 +358,45 @@ class InputWindow(QWidget):
 
         self.add_thread.start()
 
-        self.stack.setCurrentIndex(4)
+        #self.stack.setCurrentIndex(4)
+
+    def on_add_finished(self, filename):
+        self.status_label.setText(f"Status: exported cart to {filename}")
+
+    def export_cart(self, title):
+        cart_key_map = {
+            "Best Price": "best_price_cart",
+            "Fewest Stores": "fewest_stores_cart",
+            "Balanced": "balanced_cart",
+            "Custom": "custom_cart"
+        }
+
+        key = cart_key_map.get(title)
+        cart = self.cart_results.get(key)
+
+        if not cart:
+            QMessageBox.warning(self, "Missing Cart", "No cart results available.")
+            return
+
+        # Threading
+        self.add_thread = QThread()
+        self.add_worker = ExportWorker(cart)
+        self.add_worker.moveToThread(self.add_thread)
+
+        self.add_thread.started.connect(self.add_worker.run)
+        self.add_worker.finished.connect(self.on_export_finished)
+        self.add_worker.finished.connect(self.add_thread.quit)
+        self.add_worker.finished.connect(self.add_worker.deleteLater)
+        self.add_thread.finished.connect(self.add_thread.deleteLater)
+
+        self.add_worker.error.connect(lambda e: QMessageBox.warning(self, "Error", e))
+
+        self.add_thread.start()
+
+        #self.stack.setCurrentIndex(4)
+
+    def on_export_finished(self, filename):
+        self.status_label.setText(f"Status: exported cart to {filename}")
 
     # --------------------------
     # PAGE 2 — waiting page
@@ -529,6 +578,7 @@ class ScrapeWorker(QObject):
             # Call your long-running function
             start_scraping(self.cards,self.acceptable_conditions)
             shutdown_all_but_one_driver()
+            #shutdown_driver_pool()
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -612,6 +662,24 @@ class AddCartWorker(QObject):
             add_potential_cart_to_cart(driver, self.cart)
             release_driver(driver)
             self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+class ExportWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, cart):
+        super().__init__()
+        self.cart = cart
+
+    def run(self):
+        try:
+            #driver = get_driver()
+            #add_potential_cart_to_cart(driver, self.cart)
+            #release_driver(driver)
+            filename = export_to_csv(self.cart)
+            self.finished.emit(filename)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1048,8 +1116,8 @@ def find_stores(card,driver=None,num_retries=0):
     
     pages = get_total_pages(driver)
     #print("Total pages of results for card '" + card["name"] + "': " + str(pages))
-
-    #paginate through all pages TODO: fix the thing where it goes instantly to the next page after the first one
+    page = 1
+    #paginate through all pages
     for page in range(1, pages + 1):
         if "page=" in card["link"]:
             # Replace existing page number
@@ -1068,6 +1136,12 @@ def find_stores(card,driver=None,num_retries=0):
         while result is None:
             try:
                 result = WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section.listing-item")))
+                if num_retries_pages > 0:
+                    items = driver.find_elements(By.CSS_SELECTOR, "ul.tcg-base-dropdown li.tcg-base-dropdown__item")
+                    for item in items:
+                        if item.text.strip() == str(50):
+                            item.click()
+                            break
             except Exception as e:
                 print(f"Error in find_stores pagination timeout exception: {e}")
                 result = "uhoh"
@@ -1774,6 +1848,12 @@ def add_potential_cart_to_cart(driver,cart):
                     exit()
                     return
                 
+                items = driver.find_elements(By.CSS_SELECTOR, "ul.tcg-base-dropdown li.tcg-base-dropdown__item")
+                for item in items:
+                    if item.text.strip() == str(50):
+                        item.click()
+                        break
+
                 qty_to_add = str(listing["qty"])
                 #try to add it to the cart
                 listings = driver.find_elements(By.CSS_SELECTOR, "section.listing-item")
@@ -1816,7 +1896,8 @@ def add_potential_cart_to_cart(driver,cart):
                                 button = driver_listing.find_element(By.CSS_SELECTOR, "button[data-testid^='add-to-cart__submit--']")
                                 #click button
                                 driver.execute_script("arguments[0].click();", button)
-                                time.sleep(3)
+                                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.tcg-snackbar__message")))
+                                time.sleep(1)
                                 break
                             except Exception as e:
                                 print(f"Error adding card from {link}: {e}")
@@ -1824,6 +1905,54 @@ def add_potential_cart_to_cart(driver,cart):
                                 print(listing)
                                 print("available values: " + str(available_values))
     return
+
+def export_to_csv(cart):
+    """
+    Exports the cart details to a CSV file.
+    """
+    
+    if not cart or not cart.get("cart"):
+        print("No cart to export.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"tcgplayer_cart_{timestamp}.csv"
+
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Store ID", "Card Name", "Printing", "Foil", "Quantity", "Price Each", "Total Price", "Market Price", "Listing Link"])
+
+        for sid, store_data in cart["cart"].items():
+            items = store_data.get("items", {})
+
+            for wk, listings in items.items():
+                name, printing, foil = wk
+
+                for lst in listings:
+                    qty = lst.get("qty", 0)
+                    price_each = lst.get("price_each", 0.0)
+                    total = lst.get("total", 0.0)
+                    market = float(lst["raw"]["market_price"])
+                    # reorder link to make it work
+                    link = lst["raw"]["link"]
+                    link = link.split("?")[0]  
+                    quality = lst["raw"]["quality"]
+                    if "Near Mint" in quality:
+                        condition = "Near+Mint"
+                    elif "Lightly Played" in quality:
+                        condition = "Lightly+Played"
+                    elif "Moderately Played" in quality:
+                        condition = "Moderately+Played"
+                    link += "?seller=" + sid + "&Condition=" + condition
+                    if "Foil" in condition:
+                        link += "&Printing=Foil"
+                    else:
+                        link += "&Printing=Normal"
+
+                    writer.writerow([sid, name, printing, foil, qty, f"${price_each:.2f}", f"${total:.2f}", f"${market:.2f}", link])
+
+    print(f"Cart exported to {filename}")
+    return filename
 
 def search_multiple_weight_configs(wanted_cards, stores, weight_grid, beam_width, time_limit):
     """
